@@ -356,7 +356,7 @@ struct Coroutine {
     /// Coroutine stack
     stack: Stack,
 
-    /// All handles, weak to avoid `Rc`-cycle
+    /// All handles
     io : Vec<Rc<RefCell<EventSourceShared>>>,
 
     /// Newly spawned `Coroutine`-es
@@ -365,12 +365,12 @@ struct Coroutine {
 
 fn token_to_ids(token : Token) -> (CoroutineId, EventSourceId) {
     let val = token.as_usize();
-    (CoroutineId(val >> 16), EventSourceId(val & 0xffff))
+    (CoroutineId(val >> 10), EventSourceId(val & 0x3ff))
 }
 
 fn token_from_ids(co_id : CoroutineId, io_id : EventSourceId) -> Token {
     // TODO: Add checks and stuff
-    Token((co_id.as_usize() << 16) | io_id.as_usize())
+    Token((co_id.as_usize() << 10) | io_id.as_usize())
 }
 
 /// After `resume()` on the `Coroutine.handle` finished,
@@ -422,7 +422,7 @@ fn ready(rc_coroutine : &RcCoroutine,
             // more than one event sources were reported ready
             // in one group of events, and first event source
             // deregistered the later ones
-            debug!("spurious event for event source couroutine is not blocked on");
+            debug!("spurious event for event source coroutine is not blocked on");
             false
         } else if let State::BlockedOn(rw) = co_shared.state {
             match rw {
@@ -505,7 +505,7 @@ impl Coroutine {
 
             Rc::new(RefCell::new(coroutine))
         }).expect("Run out of slab for coroutines");
-        server.borrow_mut().coroutines_no += 1;
+        server.borrow_mut().coroutines_num += 1;
 
         let coroutine_ref = server.borrow().coroutines[id].clone();
 
@@ -567,7 +567,7 @@ impl Coroutine {
 
             context.init_with(
                 init_fn,
-                unsafe { transmute(&server_shared.borrow_mut().context as *const Context) },
+                unsafe { transmute(&server_shared.borrow().context as *const Context) },
                 move || {
                     trace!("Coroutine: started");
                     let mut mioco_handle = MiocoHandle {
@@ -600,6 +600,7 @@ impl Coroutine {
         if self.is_finished() {
             trace!("Coroutine: deregistering");
             self.deregister_all(event_loop);
+            //self.io.clear();
         } else {
             self.reregister_blocked_on(event_loop)
         }
@@ -746,8 +747,9 @@ impl Drop for CoroutineGuard {
         let mut co_shared = self.coroutine_shared.borrow_mut();
 
         let id = co_shared.id;
+        co_shared.blocked_on.clear();
         co_shared.server_shared.borrow_mut().coroutines.remove(Token(id.as_usize())).unwrap();
-        co_shared.server_shared.borrow_mut().coroutines_no -= 1;
+        co_shared.server_shared.borrow_mut().coroutines_num -= 1;
         // TODO: https://github.com/contain-rs/bit-vec/pulls
         co_shared.blocked_on.clear();
 
@@ -773,8 +775,9 @@ struct EventSourceShared {
 impl EventSourceShared {
     /// Handle `hup` condition
     fn hup(&mut self, _event_loop: &mut EventLoop<Handler>, _token: Token) {
-            self.peer_hup = true;
-        }
+        trace!("hup");
+        self.peer_hup = true;
+    }
 
     /// Reregister oneshot handler for the next event
     fn reregister(&mut self, event_loop: &mut EventLoop<Handler>, rw : RW) {
@@ -796,7 +799,7 @@ impl EventSourceShared {
 
             if !self.registered {
                 self.registered = true;
-                Evented::register(&*self.io, event_loop, token , interest);
+                Evented::register(&*self.io, event_loop, token, interest);
             } else {
                 Evented::reregister(&*self.io, event_loop, token, interest);
              }
@@ -1302,7 +1305,7 @@ struct HandlerShared {
     coroutines: Slab<RcCoroutine>,
 
     /// Number of `Coroutine`-s running in the `Handler`.
-    coroutines_no : u32,
+    coroutines_num : u32,
 
     /// Context saved when jumping into coroutine
     context: Context,
@@ -1312,7 +1315,7 @@ impl HandlerShared {
     fn new() -> Self {
         HandlerShared {
             coroutines: Slab::new(32 * 1024),
-            coroutines_no: 0,
+            coroutines_num: 0,
             context: Context::empty(),
         }
     }
@@ -1339,18 +1342,14 @@ impl mio::Handler for Handler {
     type Message = Token;
 
     fn tick(&mut self, event_loop: &mut mio::EventLoop<Self>) {
-        let no = self.shared.borrow().coroutines_no;
-        trace!("mioco::Handler::tick(); coroutines_no = {}", no);
-        if no == 0 {
+        let coroutines_num = self.shared.borrow().coroutines_num;
+        trace!("Handler::tick(); coroutines_num = {}", coroutines_num);
+        if coroutines_num == 0 {
             event_loop.shutdown();
         }
     }
 
     fn ready(&mut self, event_loop: &mut mio::EventLoop<Handler>, token: mio::Token, events: mio::EventSet) {
-        // It's possible we got an event for a Source that was deregistered
-        // by finished coroutine. In case the token is already occupied by
-        // different source, we will wake it up needlessly. If it's empty, we just
-        // ignore the event.
         trace!("Handler::ready(token={:?})", token);
         let (co_id, _) = token_to_ids(token);
         let co = match self.shared.borrow().coroutines.get(Token(co_id.as_usize())) {
@@ -1406,19 +1405,19 @@ impl Mioco {
                 ref mut event_loop,
             } = *self;
 
-            let shared = server.shared.clone();
+            {
+                let shared = server.shared.clone();
+                let coroutine_ref = Coroutine::spawn(shared, f);
+                let coroutine_shared = coroutine_ref.borrow().shared.clone();
+                coroutine_resume(&coroutine_shared);
+                after_resume(&coroutine_ref, event_loop);
+            }
 
-            let coroutine_ref = Coroutine::spawn(shared, f);
-
-            trace!("Initial resume");
-            let coroutine_shared = coroutine_ref.borrow().shared.clone();
-            coroutine_resume(&coroutine_shared);
-            after_resume(&coroutine_ref, event_loop);
-
-            let coroutines_no = server.shared.borrow().coroutines_no;
-            if  coroutines_no > 0 {
-                trace!("Start event loop");
+            let coroutines_num = server.shared.borrow().coroutines_num;
+            if  coroutines_num > 0 {
+                trace!("Start event_loop");
                 event_loop.run(server).unwrap();
+                trace!("Finished event_loop");
             } else {
                 trace!("No coroutines to start event loop with");
             }
