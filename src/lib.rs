@@ -35,7 +35,6 @@
 #![cfg_attr(test, feature(convert))]
 #![feature(result_expect)]
 #![feature(reflect_marker)]
-#![feature(rc_weak)]
 #![feature(rt)]
 #![warn(missing_docs)]
 
@@ -49,7 +48,7 @@ extern crate bit_vec;
 extern crate time;
 
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::{Rc};
 use std::io;
 use std::mem::{transmute, size_of_val};
 
@@ -107,7 +106,7 @@ pub struct Event {
 }
 
 impl Event {
-    /// Index of the EventSourceRefShared handle
+    /// Index of the EventSourceShared handle
     pub fn id(&self) -> EventSourceId {
         self.id
     }
@@ -313,7 +312,7 @@ impl Evented for Timer {
 }
 
 type RcCoroutine = Rc<RefCell<Coroutine>>;
-type RcEventSourceRefShared = Rc<RefCell<EventSourceRefShared>>;
+type RcEventSourceShared = Rc<RefCell<EventSourceShared>>;
 type ArcMailboxShared<T> = Arc<Mutex<MailboxShared<T>>>;
 type RcHandlerShared = Rc<RefCell<HandlerShared>>;
 type RcCoroutineShared = Rc<RefCell<CoroutineShared>>;
@@ -340,13 +339,16 @@ struct CoroutineShared {
 
     /// `Coroutine` will send exit status on it's finish
     exit_notificators : Vec<MailboxOuterEnd<ExitStatus>>,
+
+    /// Id
+    id : CoroutineId,
 }
 
 /// *`mioco` coroutine* (a.k.a. *mioco handler*)
 ///
 /// Mioco
 ///
-/// Referenced by EventSourceRefShared running within it.
+/// Referenced by EventSourceShared running within it.
 struct Coroutine {
     /// Shared data
     shared : RcCoroutineShared,
@@ -355,10 +357,20 @@ struct Coroutine {
     stack: Stack,
 
     /// All handles, weak to avoid `Rc`-cycle
-    io : Vec<Weak<RefCell<EventSourceRefShared>>>,
+    io : Vec<Rc<RefCell<EventSourceShared>>>,
 
     /// Newly spawned `Coroutine`-es
     children_to_start : Vec<RcCoroutine>,
+}
+
+fn token_to_ids(token : Token) -> (CoroutineId, EventSourceId) {
+    let val = token.as_usize();
+    (CoroutineId(val >> 8), EventSourceId(val & 0xff))
+}
+
+fn token_from_ids(co_id : CoroutineId, io_id : EventSourceId) -> Token {
+    // TODO: Add checks and stuff
+    Token((co_id.as_usize() << 8) | io_id.as_usize())
 }
 
 impl Coroutine {
@@ -366,26 +378,32 @@ impl Coroutine {
     where F : FnOnce(&mut MiocoHandle) -> io::Result<()> + 'static {
 
         trace!("Coroutine: spawning");
+        let id = server.borrow_mut().coroutines.insert_with(|id| {
+            let id = CoroutineId(id.as_usize());
+
+            let shared = CoroutineShared {
+                state: State::Running,
+                id: id,
+                last_event: Event{ rw: RW::Read, id: EventSourceId(0)},
+                context: Context::empty(),
+                server_shared: server.clone(),
+                blocked_on: Default::default(),
+                exit_notificators: Vec::new(),
+                registered: Default::default(),
+            };
+
+            let coroutine = Coroutine {
+                shared: Rc::new(RefCell::new(shared)),
+                io: Vec::with_capacity(4),
+                children_to_start: Vec::new(),
+                stack: Stack::new(1024 * 1024),
+            };
+
+            Rc::new(RefCell::new(coroutine))
+        }).expect("Run out of slab for corotoutines");
         server.borrow_mut().coroutines_no += 1;
 
-        let shared = CoroutineShared {
-            state: State::Running,
-            last_event: Event{ rw: RW::Read, id: EventSourceId(0)},
-            context: Context::empty(),
-            server_shared: server,
-            blocked_on: Default::default(),
-            exit_notificators: Vec::new(),
-            registered: Default::default(),
-        };
-
-        let coroutine = Coroutine {
-            shared: Rc::new(RefCell::new(shared)),
-            io: Vec::with_capacity(4),
-            children_to_start: Vec::new(),
-            stack: Stack::new(1024 * 1024),
-        };
-
-        let coroutine_ref = Rc::new(RefCell::new(coroutine));
+        let coroutine_ref = server.borrow().coroutines[id].clone();
 
         struct SendFnOnce<F>
         {
@@ -469,6 +487,81 @@ impl Coroutine {
 
         coroutine_ref
     }
+    pub fn ready(&mut self,
+                 event_loop : &mut EventLoop<Handler>,
+                 token : Token,
+                 events : EventSet,
+                 ) {
+        let (_, io_id) = token_to_ids(token);
+
+        let io = self.io[io_id.as_usize()].clone();
+
+        if events.is_hup() {
+            io.borrow_mut().hup(event_loop, token);
+        }
+
+        let should_resume = {
+            let mut co_shared = self.shared.borrow_mut();
+
+            co_shared.registered.set(io_id.as_usize(), false);
+
+            if !co_shared.blocked_on.get(io_id.as_usize()).unwrap() {
+                // spurious event, probably after select in which
+                // more than one event sources were reported ready
+                // in one group of events, and first event source
+                // deregistered the later ones
+                debug!("spurious event for event source couroutine is not blocked on");
+                false
+            } else if let State::BlockedOn(rw) = co_shared.state {
+                match rw {
+                    RW::Read if !events.is_readable() && !events.is_hup() => {
+                        debug!("spurious not read event for coroutine blocked on read");
+                        false
+                    },
+                    RW::Write if !events.is_writable() => {
+                        debug!("spurious not write event for coroutine blocked on write");
+                        false
+                    },
+                    RW::Both if !events.is_readable() && !events.is_hup() && !events.is_writable() => {
+                        debug!("spurious unknown type event for coroutine blocked on read/write");
+                        false
+                    },
+                    _ => {
+                        if io.borrow().io.should_resume() {
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            } else {
+                debug_assert!(co_shared.state.is_finished());
+                false
+            }
+        };
+
+        if should_resume {
+            // Wake coroutine on HUP, as it was read, to potentially let it fail the read and move on
+            let event = match (events.is_readable() | events.is_hup(), events.is_writable()) {
+                (true, true) => RW::Both,
+                (true, false) => RW::Read,
+                (false, true) => RW::Write,
+                (false, false) => panic!(),
+            };
+            {
+                let mut co_shared = self.shared.borrow_mut();
+                co_shared.state = State::Running;
+                co_shared.last_event = Event {
+                    rw: event,
+                    id: io_id,
+                };
+            };
+
+            resume(&self.shared);
+        }
+
+        self.after_resume(event_loop);
+    }
 
     fn is_finished(&self) -> bool {
         self.shared.borrow().state.is_finished()
@@ -502,15 +595,9 @@ impl Coroutine {
     }
 
     fn deregister_all(&mut self, event_loop: &mut EventLoop<Handler>) {
-        let shared = self.shared.borrow();
-        let mut shared = shared.server_shared.borrow_mut();
-
         for i in 0..self.io.len() {
-            let io = self.io[i].upgrade().unwrap();
-            let mut io = io.borrow_mut();
+            let mut io = self.io[i].borrow_mut();
             io.deregister(event_loop);
-            trace!("Removing source token={:?}", io.token);
-            shared.sources.remove(io.token).expect("cleared empty slot");
         }
     }
 
@@ -526,7 +613,7 @@ impl Coroutine {
             ref shared,
             ..
         } = *self;
-        
+
         let CoroutineShared {
             ref mut blocked_on,
             ref mut registered,
@@ -546,14 +633,12 @@ impl Coroutine {
                     let bit = bit_size - 1 - lz;
                     debug_assert!(bit < bit_size);
                     block &= !(1 << bit);
-                    let io = io[i + bit].upgrade().unwrap();
+                    let mut io = io[i + bit].borrow_mut();
                     if registered_block & (1 << bit) != 0 {
                         debug_assert!(blocked_on_block & (1 << bit) == 0);
-                        let io = io.borrow();
                         io.unreregister(event_loop);
                     } else {
                         debug_assert!(blocked_on_block & (1 << bit) != 0);
-                        let mut io = io.borrow_mut();
                         io.reregister(event_loop, rw);
                     }
                 }
@@ -642,6 +727,8 @@ impl Drop for CoroutineGuard {
         let mut co_shared = self.coroutine_shared.borrow_mut();
 
         co_shared.server_shared.borrow_mut().coroutines_no -= 1;
+        let id = co_shared.id;
+        co_shared.server_shared.borrow_mut().coroutines.remove(Token(id.as_usize())).unwrap();
         // TODO: https://github.com/contain-rs/bit-vec/pulls
         co_shared.blocked_on.clear();
 
@@ -656,16 +743,15 @@ impl Drop for CoroutineGuard {
 /// Wrapped mio IO (mio::Evented+TryRead+TryWrite)
 ///
 /// `Handle` is just a cloneable reference to this struct
-struct EventSourceRefShared {
+struct EventSourceShared {
     coroutine_shared: RcCoroutineShared,
-    token: Token,
-    id : usize, /// Index in MiocoHandle::handles
+    id : EventSourceId,
     io : Box<Evented+'static>,
     peer_hup: bool,
     registered: bool,
 }
 
-impl EventSourceRefShared {
+impl EventSourceShared {
     /// Handle `hup` condition
     fn hup(&mut self, _event_loop: &mut EventLoop<Handler>, _token: Token) {
             self.peer_hup = true;
@@ -687,11 +773,13 @@ impl EventSourceRefShared {
                 interest = interest | mio::EventSet::writable();
             }
 
+            let token = token_from_ids(self.coroutine_shared.borrow().id, self.id);
+
             if !self.registered {
                 self.registered = true;
-                Evented::register(&*self.io, event_loop, self.token, interest);
+                Evented::register(&*self.io, event_loop, token , interest);
             } else {
-                Evented::reregister(&*self.io, event_loop, self.token, interest);
+                Evented::reregister(&*self.io, event_loop, token, interest);
              }
         }
 
@@ -699,22 +787,18 @@ impl EventSourceRefShared {
     fn unreregister(&self, event_loop: &mut EventLoop<Handler>) {
             debug_assert!(self.registered);
             let interest = mio::EventSet::none();
-            Evented::reregister(&*self.io, event_loop, self.token, interest);
+            let token = token_from_ids(self.coroutine_shared.borrow().id, self.id);
+            Evented::reregister(&*self.io, event_loop, token, interest);
         }
 
     /// Un-reregister events we're not interested in anymore
     fn deregister(&mut self, event_loop: &mut EventLoop<Handler>) {
             if self.registered {
-                Evented::deregister(&*self.io, event_loop, self.token);
+                let token = token_from_ids(self.coroutine_shared.borrow().id, self.id);
+                Evented::deregister(&*self.io, event_loop, token);
                 self.registered = false;
             }
         }
-}
-
-/// `mioco` wrapper over raw structure implementing `mio::Evented` trait
-#[derive(Clone)]
-struct EventSourceRef {
-    inn : RcEventSourceRefShared,
 }
 
 /// Event source inside a coroutine
@@ -727,7 +811,7 @@ struct EventSourceRef {
 /// `MiocoHandle::timeout()`.
 #[derive(Clone)]
 pub struct EventSource<T> {
-    inn : RcEventSourceRefShared,
+    inn : RcEventSourceShared,
     _t: PhantomData<T>,
 }
 
@@ -743,6 +827,19 @@ impl EventSourceId {
     }
 }
 
+/// Id of a Coroutine used to enumerate them
+///
+/// It's unique within a thread
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CoroutineId(usize);
+
+impl CoroutineId {
+    fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+
 impl<T> EventSource<T>
 where T : Reflect+'static {
     /// Mark the `EventSourceRef` blocked and block until `Handler` does
@@ -754,7 +851,7 @@ where T : Reflect+'static {
             co_shared.state = State::BlockedOn(rw);
             // TODO: https://github.com/contain-rs/bit-vec/pulls
             co_shared.blocked_on.clear();
-            co_shared.blocked_on.set(inn.id, true);
+            co_shared.blocked_on.set(inn.id.as_usize(), true);
         };
         trace!("coroutine blocked on {:?}", rw);
         let co_shared_ref = &self.inn.borrow().coroutine_shared;
@@ -764,7 +861,7 @@ where T : Reflect+'static {
             let co_shared = inn.coroutine_shared.borrow_mut();
             debug_assert!(rw.has_read() || co_shared.last_event.has_write());
             debug_assert!(rw.has_write() || co_shared.last_event.has_read());
-            debug_assert!(co_shared.last_event.id().as_usize() == inn.id);
+            debug_assert!(co_shared.last_event.id().as_usize() == inn.id.as_usize());
         }
     }
 
@@ -784,10 +881,10 @@ where T : Reflect+'static {
 
     /// Index identificator of a `EventSource`
     pub fn id(&self) -> EventSourceId {
-        EventSourceId(self.inn.borrow().id)
+        EventSourceId(self.inn.borrow().id.as_usize())
     }
 }
-
+/*
 impl EventSourceRef {
     /// Readable event handler
     ///
@@ -807,9 +904,9 @@ impl EventSourceRef {
             let id = inn.id;
             let mut co_shared = inn.coroutine_shared.borrow_mut();
 
-            co_shared.registered.set(id, false);
+            co_shared.registered.set(id.as_usize(), false);
 
-            if !co_shared.blocked_on.get(id).unwrap() {
+            if !co_shared.blocked_on.get(id.as_usize()).unwrap() {
                 // spurious event, probably after select in which
                 // more than one event sources were reported ready
                 // in one group of events, and first event source
@@ -858,7 +955,7 @@ impl EventSourceRef {
                 co_shared.state = State::Running;
                 co_shared.last_event = Event {
                     rw: event,
-                    id: EventSourceId(my_id),
+                    id: my_id,
                 };
             };
 
@@ -878,7 +975,7 @@ impl EventSourceRef {
 
     }
 }
-
+*/
 impl<T> EventSource<T>
 where T : mio::TryAccept+Reflect+'static {
     /// Block on accept
@@ -998,13 +1095,12 @@ fn select_impl_set_mask_from_ids(ids : &[EventSourceId], blocked_on : &mut BitVe
     }
 }
 
-fn select_impl_set_mask_rc_handles(handles : &[Weak<RefCell<EventSourceRefShared>>], blocked_on: &mut BitVec<usize>) {
+fn select_impl_set_mask_rc_handles(handles : &[Rc<RefCell<EventSourceShared>>], blocked_on: &mut BitVec<usize>) {
     {
         // TODO: https://github.com/contain-rs/bit-vec/pulls
         blocked_on.clear();
-        for handle in handles {
-            let io = handle.upgrade().unwrap();
-            blocked_on.set(io.borrow().id, true);
+        for io in handles {
+            blocked_on.set(io.borrow().id.as_usize(), true);
         }
     }
 }
@@ -1062,33 +1158,20 @@ impl MiocoHandle {
     /// to perform IO.
     pub fn wrap<T : 'static>(&mut self, io : T) -> EventSource<T>
     where T : Evented {
-        let token = {
-            let co = self.coroutine.borrow();
-            let co_shared = co.shared.borrow();
-            let mut shared = co_shared.server_shared.borrow_mut();
-            shared.sources.insert_with(|token| {
-                EventSourceRef {
-                    inn: Rc::new(RefCell::new(
-                                 EventSourceRefShared {
-                                     coroutine_shared: co.shared.clone(),
-                                     io: Box::new(io),
-                                     token: token,
-                                     peer_hup: false,
-                                     id: self.coroutine.borrow().io.len(),
-                                     registered: false,
-                                 }
-                                 )),
-                }
-            })
-        }.expect("run out of tokens");
-        trace!("Added source token={:?}", token);
-
         let io_new = {
             let co = self.coroutine.borrow();
-            let co_shared = co.shared.borrow();
-            let shared = co_shared.server_shared.borrow_mut();
-            shared.sources[token].inn.clone()
+
+            Rc::new(RefCell::new(
+                    EventSourceShared {
+                        coroutine_shared: co.shared.clone(),
+                        io: Box::new(io),
+                        peer_hup: false,
+                        id: EventSourceId(co.io.len()),
+                        registered: false,
+                    }
+                    ))
         };
+
 
         let handle = EventSource {
             inn: io_new.clone(),
@@ -1099,7 +1182,7 @@ impl MiocoHandle {
             ref mut io,
             ref shared,
             ..
-        } = *self.coroutine.borrow_mut();
+        } = *self.coroutine.borrow();
 
         let CoroutineShared {
             ref mut registered,
@@ -1107,7 +1190,7 @@ impl MiocoHandle {
             ..
         } = *shared.borrow_mut();
 
-        io.push(Rc::downgrade(&io_new.clone()));
+        io.push(io_new.clone());
         blocked_on.push(false);
         registered.push(false);
         debug_assert!(io.len() == blocked_on.len());
@@ -1289,7 +1372,7 @@ impl MiocoHandle {
 struct HandlerShared {
     /// Slab allocator
     /// TODO: dynamically growing slab would be better; or a fast hashmap?
-    sources : Slab<EventSourceRef>,
+    coroutines: Slab<RcCoroutine>,
 
     /// Number of `Coroutine`-s running in the `Handler`.
     coroutines_no : u32,
@@ -1301,7 +1384,7 @@ struct HandlerShared {
 impl HandlerShared {
     fn new() -> Self {
         HandlerShared {
-            sources: Slab::new(32 * 1024),
+            coroutines: Slab::new(32 * 1024),
             coroutines_no: 0,
             context: Context::empty(),
         }
@@ -1340,14 +1423,15 @@ impl mio::Handler for Handler {
         // different source, we will wake it up needlessly. If it's empty, we just
         // ignore the event.
         trace!("Handler::ready(token={:?})", token);
-        let mut source = match self.shared.borrow().sources.get(token) {
-            Some(source) => source.clone(),
+        let (co_id, _) = token_to_ids(token);
+        let co = match self.shared.borrow().coroutines.get(Token(co_id.as_usize())) {
+            Some(co) => co.clone(),
             None => {
                 trace!("Handler::ready() ignored");
                 return
             },
         };
-        source.ready(event_loop, token, events);
+        co.borrow_mut().ready(event_loop, token, events);
         trace!("Handler::ready finished");
     }
 
